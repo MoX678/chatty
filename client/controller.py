@@ -113,38 +113,40 @@ class ChatController(QObject):
 
     def _load_persisted_history(self) -> None:
         log_dir = self.net.log_dir
-        for g in GROUPS:
-            ctx = f"group_{g}"
-            self.histories[ctx] = load_history(log_dir, ctx)
         partners = list_dm_partners(log_dir)
         self.dm_partners = set(partners)
-        for p in partners:
-            self.histories[f"dm_{p}"] = load_history(log_dir, f"dm_{p}")
+        contexts = [f"group_{g}" for g in GROUPS] + [f"dm_{p}" for p in partners]
+        for ctx in contexts:
+            self.histories[ctx] = load_history(log_dir, ctx)
 
     # ----------------------------------------------------------------------
     # Context navigation
     # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _ctx_parts(ctx: str) -> Tuple[str, str]:
+        """Return ('group'|'dm', target) for a context key."""
+        kind, _, target = ctx.partition("_")
+        return kind, target
 
     def set_context(self, ctx: str) -> None:
         """Switch the active conversation. Clears unread counter for DMs."""
         if not ctx:
             return
         self.current_context = ctx
-        if ctx.startswith("dm_"):
-            other = ctx.split("_", 1)[1]
-            if self.unread_dms.pop(other, 0) > 0:
-                self.dm_list_changed.emit()
+        kind, other = self._ctx_parts(ctx)
+        if kind == "dm" and self.unread_dms.pop(other, 0) > 0:
+            self.dm_list_changed.emit()
         if ctx not in self.histories:
             self.histories[ctx] = []
         self.history_changed.emit(ctx)
 
     def subtitle_for(self, ctx: str) -> str:
         """Compute the header subtitle for a given context."""
-        if ctx.startswith("group_"):
+        kind, other = self._ctx_parts(ctx)
+        if kind == "group":
             return "Public group · all members"
-        other = ctx.split("_", 1)[1] if "_" in ctx else ctx
-        online = other in self.online_users
-        return "Direct message · " + ("online" if online else "offline")
+        return "Direct message · " + ("online" if other in self.online_users else "offline")
 
     # ----------------------------------------------------------------------
     # Sidebar data
@@ -176,31 +178,30 @@ class ChatController(QObject):
 
         Returns True if anything was sent."""
         text = (text or "").strip()
-        att_payload: Optional[dict] = None
-        if self.pending_attachment is not None:
-            p = self.pending_attachment
-            att_payload = {
-                "mime": p["mime"],
-                "name": p["name"],
-                "data": base64.b64encode(p["data"]).decode("ascii"),
-            }
-        if not text and att_payload is None:
+        att = self._pending_send_payload()
+        if not text and att is None:
             return False
 
-        ctx = self.current_context
-        if ctx.startswith("group_"):
-            self.net.send_group(ctx.split("_", 1)[1], text, attachment=att_payload)
-        else:
-            target = ctx.split("_", 1)[1]
-            self.net.send_dm(target, text, attachment=att_payload)
+        kind, target = self._ctx_parts(self.current_context)
+        self.net.send(kind, target, text, attachment=att)
 
-        if att_payload is not None:
+        if att is not None:
             self.clear_pending()
         return True
+
+    def _pending_send_payload(self) -> Optional[dict]:
+        """Serialize `self.pending_attachment` for the wire (base64 data)."""
+        p = self.pending_attachment
+        if p is None:
+            return None
+        return {"mime": p["mime"], "name": p["name"],
+                "data": base64.b64encode(p["data"]).decode("ascii")}
 
     # ----------------------------------------------------------------------
     # Image staging (paste / drop / pick)
     # ----------------------------------------------------------------------
+
+    _FMT_MIME = {"JPEG": "image/jpeg", "PNG": "image/png"}
 
     def stage_qimage(self, image: QImage, mime: str, name: str) -> bool:
         """Encode + downscale a QImage and stash it as the pending attachment."""
@@ -212,30 +213,43 @@ class ChatController(QObject):
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-        fmt = "JPEG" if mime == "image/jpeg" else "PNG"
-        out_mime = "image/jpeg" if fmt == "JPEG" else "image/png"
+
+        # Try the requested format; fall back to JPEG if a PNG is too big.
+        formats = ["JPEG"] if mime == "image/jpeg" else ["PNG", "JPEG"]
+        data = b""
+        for fmt in formats:
+            data = self._encode_image(image, fmt)
+            if data is None:
+                self.warning_requested.emit("Encode failed", f"Could not encode image as {fmt}")
+                return False
+            if len(data) <= MAX_IMAGE_BYTES:
+                out_mime = self._FMT_MIME[fmt]
+                return self._set_pending(
+                    out_mime, name or f"image.{ext_for_mime(out_mime)}", data, image)
+
+        self.warning_requested.emit(
+            "Image too large",
+            f"Encoded payload is {len(data)//1024} KB; max is "
+            f"{MAX_IMAGE_BYTES // 1024} KB.")
+        return False
+
+    @staticmethod
+    def _encode_image(image: QImage, fmt: str) -> Optional[bytes]:
         buf = QBuffer()
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         ok = image.save(buf, fmt, 88 if fmt == "JPEG" else -1)
         buf.close()
-        if not ok:
-            self.warning_requested.emit("Encode failed", f"Could not encode image as {fmt}")
-            return False
-        data = bytes(buf.data())
-        if len(data) > MAX_IMAGE_BYTES and fmt == "PNG":
-            return self.stage_qimage(image, "image/jpeg", name)
-        if len(data) > MAX_IMAGE_BYTES:
-            self.warning_requested.emit(
-                "Image too large",
-                f"Encoded payload is {len(data)//1024} KB; max is "
-                f"{MAX_IMAGE_BYTES // 1024} KB.")
-            return False
-        return self._set_pending(out_mime,
-                                 name or f"image.{ext_for_mime(out_mime)}",
-                                 data, image)
+        return bytes(buf.data()) if ok else None
 
     def stage_image_file(self, path: str) -> bool:
         """Read a file from disk and stage it as the pending attachment."""
+        name = os.path.basename(path)
+        if os.path.splitext(path)[1].lower() not in IMAGE_EXTS:
+            self.warning_requested.emit(
+                "Unsupported file",
+                f"Only image files can be attached.\n{name}",
+            )
+            return False
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -244,15 +258,8 @@ class ChatController(QObject):
             return False
         if not data:
             return False
-        if os.path.splitext(path)[1].lower() not in IMAGE_EXTS:
-            self.warning_requested.emit(
-                "Unsupported file",
-                f"Only image files can be attached.\n{os.path.basename(path)}",
-            )
-            return False
-        mime = mime_for_path(path)
-        name = os.path.basename(path)
 
+        # Oversized: re-encode via QImage (drops to JPEG + downscales).
         if len(data) > MAX_IMAGE_BYTES:
             img = QImage(path)
             if img.isNull():
@@ -263,7 +270,7 @@ class ChatController(QObject):
                 return False
             return self.stage_qimage(img, "image/jpeg", name)
 
-        return self._set_pending(mime, name, data, QImage(path))
+        return self._set_pending(mime_for_path(path), name, data, QImage(path))
 
     def _set_pending(self, mime: str, name: str, data: bytes,
                      preview: QImage) -> bool:
@@ -286,67 +293,57 @@ class ChatController(QObject):
     def on_user_list(self, users: list) -> None:
         self.online_users = list(users)
         self.dm_list_changed.emit()
-        if self.current_context.startswith("dm_"):
+        if self._ctx_parts(self.current_context)[0] == "dm":
             self.subtitle_changed.emit(self.subtitle_for(self.current_context))
 
-    def on_system_event(self, type_: str, user: str) -> None:
-        verb = "joined the workspace" if type_ == "join" else "left the workspace"
-        text = f"{user} {verb}"
-        ctx = "group_general"
-        entry = {
-            "kind": "system", "text": text, "ts": now_ts(), "event": type_,
-        }
-        self.histories.setdefault(ctx, []).append(entry)
-        self.entry_appended.emit(ctx, entry)
+    def on_system_event(self, event: str, user: str) -> None:
+        verb = "joined the workspace" if event == "join" else "left the workspace"
+        entry = {"kind": "system", "text": f"{user} {verb}",
+                 "ts": now_ts(), "event": event}
+        self._append_entry("group_general", entry)
 
     def on_dm(self, sender: str, target: str, message: str, attachment: dict) -> None:
-        other = target if sender == self.username else sender
+        from_other = sender != self.username
+        other = sender if from_other else target
         ctx = f"dm_{other}"
-        entry = self._make_entry(sender, message, attachment)
-        self.histories.setdefault(ctx, []).append(entry)
-
         new_partner = other not in self.dm_partners
         self.dm_partners.add(other)
 
-        # Emit append regardless; the window decides if it's the active ctx.
-        self.entry_appended.emit(ctx, entry)
+        self._receive(ctx, sender, message, attachment, notify_title=sender)
 
-        # Off-screen → bump unread.
-        if self.current_context != ctx and sender != self.username:
+        # DM-only: unread counter + sidebar refresh.
+        if from_other and self.current_context != ctx:
             self.unread_dms[other] = self.unread_dms.get(other, 0) + 1
-
-        if sender != self.username:
-            self.notify_requested.emit(sender, message or "[image]", ctx)
-
-        if new_partner or sender != self.username:
+        if from_other or new_partner:
             self.dm_list_changed.emit()
 
     def on_group(self, sender: str, target: str, message: str, attachment: dict) -> None:
-        ctx = f"group_{target}"
+        self._receive(f"group_{target}", sender, message, attachment,
+                      notify_title=f"#{target}  ·  {sender}")
+
+    def _receive(self, ctx: str, sender: str, message: str,
+                 attachment: dict, notify_title: str) -> None:
+        """Append an inbound message to `ctx` and fire notifications."""
         entry = self._make_entry(sender, message, attachment)
+        self._append_entry(ctx, entry)
+        if sender != self.username and self.current_context != ctx:
+            self.notify_requested.emit(notify_title, message or "[image]", ctx)
+
+    def _append_entry(self, ctx: str, entry: dict) -> None:
         self.histories.setdefault(ctx, []).append(entry)
         self.entry_appended.emit(ctx, entry)
-        if self.current_context != ctx and sender != self.username:
-            self.notify_requested.emit(
-                f"#{target}  ·  {sender}", message or "[image]", ctx,
-            )
 
     def _on_net_error(self, msg: str) -> None:
         self.warning_requested.emit("Network error", msg)
 
     @staticmethod
     def _make_entry(sender: str, message: str, attachment: dict) -> dict:
+        entry = {"kind": "msg", "sender": sender, "text": message, "ts": now_ts()}
         if attachment:
-            return {
-                "kind":   "image",
-                "sender": sender,
-                "text":   message,
-                "ts":     now_ts(),
-                "path":   attachment.get("path", ""),
-                "name":   attachment.get("name", ""),
-                "mime":   attachment.get("mime", ""),
-            }
-        return {"kind": "msg", "sender": sender, "text": message, "ts": now_ts()}
+            entry["kind"] = "image"
+            for k in ("path", "name", "mime"):
+                entry[k] = attachment.get(k, "")
+        return entry
 
     # ----------------------------------------------------------------------
     # Export
@@ -356,21 +353,20 @@ class ChatController(QObject):
         """Write a plain-text export of `ctx` to `path`. Emits warning on error."""
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(
-                    f"# {title} — exported "
-                    f"{datetime.now():%Y-%m-%d %H:%M}\n\n"
-                )
+                f.write(f"# {title} — exported {datetime.now():%Y-%m-%d %H:%M}\n\n")
                 for e in self.histories.get(ctx, []):
-                    if e["kind"] == "system":
-                        f.write(f"-- {e['text']} --\n")
-                    elif e["kind"] == "image":
-                        cap = f"  {e['text']}" if e.get("text") else ""
-                        f.write(f"[{e['ts']}] {e['sender']}: "
-                                f"[image: {e.get('name','')}]{cap}\n")
-                    else:
-                        f.write(f"[{e['ts']}] {e['sender']}: {e['text']}\n")
+                    f.write(self._format_export_line(e) + "\n")
         except OSError as ex:
             self.warning_requested.emit("Save failed", str(ex))
+
+    @staticmethod
+    def _format_export_line(e: dict) -> str:
+        if e["kind"] == "system":
+            return f"-- {e['text']} --"
+        if e["kind"] == "image":
+            cap = f"  {e['text']}" if e.get("text") else ""
+            return f"[{e['ts']}] {e['sender']}: [image: {e.get('name','')}]{cap}"
+        return f"[{e['ts']}] {e['sender']}: {e['text']}"
 
 
 __all__ = ["ChatController"]

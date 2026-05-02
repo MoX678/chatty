@@ -42,6 +42,8 @@ _MIME_EXT = {
     "image/webp": "webp",
     "image/bmp":  "bmp",
 }
+_EXT_MIME = {"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif",
+             "webp": "image/webp", "bmp": "image/bmp"}
 
 
 def ext_for_mime(mime: str) -> str:
@@ -50,9 +52,7 @@ def ext_for_mime(mime: str) -> str:
 
 def mime_for_path(path: str) -> str:
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    rev = {v: k for k, v in _MIME_EXT.items() if k != "image/jpg"}
-    rev["jpg"] = "image/jpeg"
-    return rev.get(ext, "application/octet-stream")
+    return _EXT_MIME.get(ext, "application/octet-stream")
 
 
 def _safe(name: str) -> str:
@@ -63,22 +63,23 @@ def _ts_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def append_text_log(log_dir: str, context: str, line: str) -> None:
-    """Append a single human-readable line to <log_dir>/<context>.txt."""
-    try:
-        with open(os.path.join(log_dir, f"{_safe(context)}.txt"), "a", encoding="utf-8") as f:
-            f.write(f"[{_ts_now()}] {line}\n")
-    except OSError:
-        pass
-
-
-def append_jsonl(log_dir: str, context: str, entry: dict) -> None:
-    """Append a JSON entry to <log_dir>/<context>.jsonl (canonical)."""
-    try:
-        with open(os.path.join(log_dir, f"{_safe(context)}.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
+def append_log(log_dir: str, context: str, entry: dict, text_line: str) -> None:
+    """Persist one message to both logs for `context`:
+      - <context>.jsonl  (canonical JSON, one entry per line)
+      - <context>.txt    (human-readable timestamped line)
+    Failures are silently ignored — logging must never break chat flow.
+    """
+    base = os.path.join(log_dir, _safe(context))
+    writes = (
+        (base + ".jsonl", json.dumps(entry, ensure_ascii=False) + "\n"),
+        (base + ".txt",   f"[{_ts_now()}] {text_line}\n"),
+    )
+    for path, line in writes:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass
 
 
 def load_history(log_dir: str, context: str) -> list:
@@ -119,12 +120,6 @@ def list_dm_partners(log_dir: str) -> list:
     return sorted(names)
 
 
-# Back-compat shim used by older call sites (kept temporarily; new code
-# should use append_text_log / append_jsonl directly).
-def append_log(context: str, line: str) -> None:
-    append_text_log(LOG_DIR, context, line)
-
-
 class NetworkClient(QThread):
     # auth + lifecycle
     auth_success      = pyqtSignal()
@@ -134,7 +129,7 @@ class NetworkClient(QThread):
 
     # inbound payloads
     user_list_changed = pyqtSignal(list)                 # [usernames]
-    system_event      = pyqtSignal(str, str)             # (type, user)
+    system_event      = pyqtSignal(str, str)             # (event, user)  — event ∈ {"join","leave"}
     # message signals carry an attachment dict (empty {} if none).
     # attachment shape on success: {"mime","name","path"}
     dm_received       = pyqtSignal(str, str, str, dict)  # (sender, target, message, attachment)
@@ -157,59 +152,11 @@ class NetworkClient(QThread):
     # ---- thread entry point ------------------------------------------------
 
     def run(self) -> None:
-        # connect
-        try:
-            self.sock = socket.create_connection((self.host, self.port), timeout=10)
-        except OSError as e:
-            self.connection_error.emit(f"Could not connect to {self.host}:{self.port}: {e}")
-            return
-
-        try:
-            self.sock.settimeout(None)
-            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
-            pass
-
-        try:
-            self.rfile = self.sock.makefile("rb")
-        except OSError as e:
-            self.connection_error.emit(f"socket setup failed: {e}")
+        if not self._connect_and_auth():
             self._close()
             return
-
-        # authenticate
-        try:
-            self._raw_send(json.dumps({
-                "action":   "login",
-                "username": self.username,
-                "password": self.password,
-            }))
-            line = self.rfile.readline()
-        except OSError as e:
-            self.connection_error.emit(f"Login I/O error: {e}")
-            self._close()
-            return
-
-        if not line:
-            self.connection_error.emit("server closed connection during login")
-            self._close()
-            return
-
-        try:
-            msg = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self.auth_failed.emit("malformed_response")
-            self._close()
-            return
-
-        if msg.get("action") != "auth_status" or msg.get("status") != "success":
-            self.auth_failed.emit(msg.get("reason", "invalid_credentials"))
-            self._close()
-            return
-
         self.auth_success.emit()
 
-        # main recv loop
         while not self._stop:
             try:
                 line = self.rfile.readline()
@@ -226,6 +173,40 @@ class NetworkClient(QThread):
         self._close()
         self.disconnected.emit()
 
+    def _connect_and_auth(self) -> bool:
+        """Open socket and complete login. Emits the appropriate error
+        signal and returns False on any failure."""
+        try:
+            self.sock = socket.create_connection((self.host, self.port), timeout=10)
+            self.sock.settimeout(None)
+            try:
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            self.rfile = self.sock.makefile("rb")
+            self._send_json({
+                "action":   "login",
+                "username": self.username,
+                "password": self.password,
+            })
+            line = self.rfile.readline()
+        except OSError as e:
+            self.connection_error.emit(f"Could not connect to {self.host}:{self.port}: {e}")
+            return False
+
+        if not line:
+            self.connection_error.emit("server closed connection during login")
+            return False
+        try:
+            msg = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.auth_failed.emit("malformed_response")
+            return False
+        if msg.get("action") != "auth_status" or msg.get("status") != "success":
+            self.auth_failed.emit(msg.get("reason", "invalid_credentials"))
+            return False
+        return True
+
     # ---- inbound dispatch --------------------------------------------------
 
     def _dispatch(self, msg: dict) -> None:
@@ -234,23 +215,18 @@ class NetworkClient(QThread):
             self.user_list_changed.emit(list(msg.get("users", [])))
         elif action == "system_event":
             self.system_event.emit(msg.get("type", ""), msg.get("user", ""))
-        elif action == "dm":
+        elif action in ("dm", "group_msg"):
             sender = msg.get("sender", "")
             target = msg.get("target", "")
             text   = msg.get("message", "")
-            other  = target if sender == self.username else sender
-            ctx    = f"dm_{other}"
+            if action == "dm":
+                other = target if sender == self.username else sender
+                ctx, signal = f"dm_{other}", self.dm_received
+            else:
+                ctx, signal = f"group_{target}", self.group_received
             local_att = self._save_attachment(ctx, sender, msg.get("attachment"))
             self._log_entry(ctx, sender, text, local_att)
-            self.dm_received.emit(sender, target, text, local_att or {})
-        elif action == "group_msg":
-            sender = msg.get("sender", "")
-            target = msg.get("target", "")
-            text   = msg.get("message", "")
-            ctx    = f"group_{target}"
-            local_att = self._save_attachment(ctx, sender, msg.get("attachment"))
-            self._log_entry(ctx, sender, text, local_att)
-            self.group_received.emit(sender, target, text, local_att or {})
+            signal.emit(sender, target, text, local_att or {})
 
     def _log_entry(self, ctx: str, sender: str, text: str, att: Optional[dict]) -> None:
         ts = _ts_now()
@@ -270,8 +246,7 @@ class NetworkClient(QThread):
         else:
             entry = {"ts": ts, "kind": "msg", "sender": sender, "text": text}
             text_line = f"{sender}: {text}"
-        append_jsonl(self.log_dir, ctx, entry)
-        append_text_log(self.log_dir, ctx, text_line)
+        append_log(self.log_dir, ctx, entry, text_line)
 
     def _save_attachment(self, ctx: str, sender: str, att) -> Optional[dict]:
         """Decode a base64 image attachment to disk; return UI-side metadata."""
@@ -307,26 +282,15 @@ class NetworkClient(QThread):
 
     # ---- outbound ----------------------------------------------------------
 
-    def send_dm(self, target: str, message: str, attachment: Optional[dict] = None) -> None:
-        # Server echoes DMs back to the sender, so logging happens in
-        # `_dispatch` for both directions — no double-log.
+    # Server echoes both DMs and group messages back to the sender, so
+    # logging happens in `_dispatch` for both directions — no double-log.
+    def send(self, kind: str, target: str, message: str,
+             attachment: Optional[dict] = None) -> None:
+        """Send a chat message. `kind` is "dm" or "group"."""
         payload = {
-            "action":  "dm",
+            "action":  "dm" if kind == "dm" else "group_msg",
             "sender":  self.username,
             "target":  target,
-            "message": message,
-        }
-        if attachment is not None:
-            payload["attachment"] = attachment
-        self._send_json(payload)
-
-    def send_group(self, group: str, message: str, attachment: Optional[dict] = None) -> None:
-        # Server broadcasts group messages to every member including the
-        # sender, so the inbound echo path handles auto-save uniformly.
-        payload = {
-            "action":  "group_msg",
-            "sender":  self.username,
-            "target":  group,
             "message": message,
         }
         if attachment is not None:
@@ -345,37 +309,30 @@ class NetworkClient(QThread):
     # ---- low level ---------------------------------------------------------
 
     def _send_json(self, payload: dict) -> None:
+        if self.sock is None:
+            return
+        blob = (json.dumps(payload) + "\n").encode("utf-8")
         try:
-            self._raw_send(json.dumps(payload))
+            with self._send_lock:
+                self.sock.sendall(blob)
         except OSError as e:
             self.connection_error.emit(f"send error: {e}")
 
-    def _raw_send(self, data: str) -> None:
-        if self.sock is None:
-            return
-        blob = (data + "\n").encode("utf-8")
-        with self._send_lock:
-            self.sock.sendall(blob)
-
     def _close(self) -> None:
-        if self.rfile is not None:
-            try:
-                self.rfile.close()
-            except OSError:
-                pass
-            self.rfile = None
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-            self.sock = None
+        for attr in ("rfile", "sock"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except OSError:
+                    pass
+                setattr(self, attr, None)
 
 
 __all__ = [
     "NetworkClient",
     "LOG_DIR", "user_log_dir",
-    "append_log", "append_text_log", "append_jsonl",
+    "append_log",
     "load_history", "list_dm_partners",
     "ext_for_mime", "mime_for_path",
 ]

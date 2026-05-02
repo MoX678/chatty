@@ -49,8 +49,6 @@ AVATAR_COLORS = [
 # ---------------------------------------------------------------------------
 
 def now_ts() -> str:
-    """Full timestamp stored in history entries (matches what NetworkClient
-    writes to JSONL on disk so live + replayed entries are uniform)."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
