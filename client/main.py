@@ -40,25 +40,27 @@ FONT_MONO = ("Courier", 10)
 
 # ── Login Dialog ─────────────────────────────────────────────────────────
 
-class LoginDialog(tk.Toplevel):
-    """Credential entry dialog. Sets ``self.result = (net, username)``."""
+class LoginDialog:
+    """Credential entry built directly on the root window."""
 
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.title("Chatty — Sign In")
-        self.geometry("360x340")
-        self.resizable(False, False)
-        self.configure(bg=BG)
-        self.transient(parent)
-        self.grab_set()
+    def __init__(self, root: tk.Tk):
+        self.root = root
         self.result = None
 
-        tk.Label(self, text="Chatty", font=FONT_HEAD,
+        root.title("Chatty \u2014 Sign In")
+        root.geometry("360x340")
+        root.resizable(False, False)
+        root.configure(bg=BG)
+
+        self.frame = tk.Frame(root, bg=BG)
+        self.frame.pack(fill="both", expand=True)
+
+        tk.Label(self.frame, text="Chatty", font=FONT_HEAD,
                  bg=BG, fg=FG).pack(pady=(24, 2))
-        tk.Label(self, text="Sign in to your workspace", font=FONT_SM,
+        tk.Label(self.frame, text="Sign in to your workspace", font=FONT_SM,
                  bg=BG, fg=FG_DIM).pack(pady=(0, 16))
 
-        f = tk.Frame(self, bg=BG)
+        f = tk.Frame(self.frame, bg=BG)
         f.pack(padx=32, fill="x")
 
         self.user_var = tk.StringVar()
@@ -89,7 +91,7 @@ class LoginDialog(tk.Toplevel):
                   font=FONT_BOLD, cursor="hand2",
                   command=self._submit).pack(fill="x", pady=(12, 0), ipady=4)
 
-        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        root.protocol("WM_DELETE_WINDOW", self._cancel)
 
     def _submit(self):
         u = self.user_var.get().strip()
@@ -105,7 +107,7 @@ class LoginDialog(tk.Toplevel):
             return
 
         self.err.config(text="Connecting\u2026")
-        self.update()
+        self.root.update()
 
         net = NetworkClient(h, port, u, p)
         ok, reason = net.connect_and_auth()
@@ -114,11 +116,12 @@ class LoginDialog(tk.Toplevel):
             return
 
         self.result = (net, u)
-        self.destroy()
+        self.frame.destroy()
+        self.root.quit()  # exit inner mainloop
 
     def _cancel(self):
         self.result = None
-        self.destroy()
+        self.root.destroy()
 
 
 # ── Main Chat Window ─────────────────────────────────────────────────────
@@ -562,18 +565,18 @@ def _make_entry(sender, message, att):
 
 def main() -> int:
     root = tk.Tk()
-    root.withdraw()
 
     login = LoginDialog(root)
-    root.wait_window(login)
+    root.mainloop()  # blocks until login completes or window closed
 
     if login.result is None:
-        root.destroy()
         return 0
 
     net, username = login.result
+    # Reconfigure root for chat UI
+    root.geometry("960x640")
+    root.resizable(True, True)
     ChatApp(root, net, username)
-    root.deiconify()
     root.mainloop()
     return 0
 
