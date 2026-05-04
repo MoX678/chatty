@@ -1,12 +1,10 @@
-"""Network worker (plain TCP, newline-delimited JSON).
+"""Network client — plain TCP, threading-based.
 
-Owns a synchronous `socket.socket` connection inside a QThread so the
-PyQt6 UI thread never blocks on I/O. All inbound JSON is parsed here and
-surfaced as `pyqtSignal`s; outbound sends are guarded by a mutex.
+No Qt dependency. Uses `threading.Thread` for the recv loop and
+callback functions for event dispatch.
 
-Auto-save: every inbound chat message is appended to a per-context
-`.txt` file under `client/logs/`. Outbound sends are persisted via the
-server's echo so each message is written exactly once.
+Auto-save: every inbound chat message is appended to per-context
+`.txt` and `.jsonl` files under `client/logs/`.
 """
 from __future__ import annotations
 
@@ -17,9 +15,7 @@ import os
 import socket
 import threading
 from datetime import datetime
-from typing import Optional
-
-from PyQt6.QtCore import QThread, pyqtSignal
+from typing import Callable, Optional
 
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
@@ -64,11 +60,7 @@ def _ts_now() -> str:
 
 
 def append_log(log_dir: str, context: str, entry: dict, text_line: str) -> None:
-    """Persist one message to both logs for `context`:
-      - <context>.jsonl  (canonical JSON, one entry per line)
-      - <context>.txt    (human-readable timestamped line)
-    Failures are silently ignored — logging must never break chat flow.
-    """
+    """Persist one message to both logs for `context`."""
     base = os.path.join(log_dir, _safe(context))
     writes = (
         (base + ".jsonl", json.dumps(entry, ensure_ascii=False) + "\n"),
@@ -83,8 +75,7 @@ def append_log(log_dir: str, context: str, entry: dict, text_line: str) -> None:
 
 
 def load_history(log_dir: str, context: str) -> list:
-    """Replay <log_dir>/<context>.jsonl into a list of entries.
-    Image paths in the JSONL are stored relative to log_dir; absolutized here."""
+    """Replay <log_dir>/<context>.jsonl into a list of entries."""
     path = os.path.join(log_dir, f"{_safe(context)}.jsonl")
     if not os.path.isfile(path):
         return []
@@ -120,23 +111,14 @@ def list_dm_partners(log_dir: str) -> list:
     return sorted(names)
 
 
-class NetworkClient(QThread):
-    # auth + lifecycle
-    auth_success      = pyqtSignal()
-    auth_failed       = pyqtSignal(str)            # reason
-    connection_error  = pyqtSignal(str)
-    disconnected      = pyqtSignal()
+class NetworkClient:
+    """TCP chat client using plain threading.
 
-    # inbound payloads
-    user_list_changed = pyqtSignal(list)                 # [usernames]
-    system_event      = pyqtSignal(str, str)             # (event, user)  — event ∈ {"join","leave"}
-    # message signals carry an attachment dict (empty {} if none).
-    # attachment shape on success: {"mime","name","path"}
-    dm_received       = pyqtSignal(str, str, str, dict)  # (sender, target, message, attachment)
-    group_received    = pyqtSignal(str, str, str, dict)  # (sender, target, message, attachment)
+    Set callback attributes (on_user_list, on_dm, etc.) before calling
+    connect_and_auth() + start_recv_loop().
+    """
 
-    def __init__(self, host: str, port: int, username: str, password: str, parent=None):
-        super().__init__(parent)
+    def __init__(self, host: str, port: int, username: str, password: str):
         self.host = host
         self.port = port
         self.username = username
@@ -145,37 +127,19 @@ class NetworkClient(QThread):
         self.rfile = None
         self._send_lock = threading.Lock()
         self._stop = False
-        # Per-user log dir: every user logged in on this machine gets a
-        # private folder so DM histories don't bleed between accounts.
         self.log_dir = user_log_dir(username)
 
-    # ---- thread entry point ------------------------------------------------
+        # Callbacks — assign before starting the recv loop.
+        self.on_user_list:    Optional[Callable[[list], None]]             = None
+        self.on_system_event: Optional[Callable[[str, str], None]]         = None
+        self.on_dm:           Optional[Callable[[str, str, str, dict], None]] = None
+        self.on_group:        Optional[Callable[[str, str, str, dict], None]] = None
+        self.on_disconnected: Optional[Callable[[], None]]                 = None
 
-    def run(self) -> None:
-        if not self._connect_and_auth():
-            self._close()
-            return
-        self.auth_success.emit()
+    # ---- connect + auth (blocking) ----------------------------------------
 
-        while not self._stop:
-            try:
-                line = self.rfile.readline()
-            except OSError:
-                break
-            if not line:
-                break
-            try:
-                msg = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            self._dispatch(msg)
-
-        self._close()
-        self.disconnected.emit()
-
-    def _connect_and_auth(self) -> bool:
-        """Open socket and complete login. Emits the appropriate error
-        signal and returns False on any failure."""
+    def connect_and_auth(self) -> tuple:
+        """Blocking connect + login handshake. Returns (ok, reason)."""
         try:
             self.sock = socket.create_connection((self.host, self.port), timeout=10)
             self.sock.settimeout(None)
@@ -191,47 +155,71 @@ class NetworkClient(QThread):
             })
             line = self.rfile.readline()
         except OSError as e:
-            self.connection_error.emit(f"Could not connect to {self.host}:{self.port}: {e}")
-            return False
+            return False, f"Could not connect to {self.host}:{self.port}: {e}"
 
         if not line:
-            self.connection_error.emit("server closed connection during login")
-            return False
+            return False, "Server closed connection during login"
         try:
             msg = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            self.auth_failed.emit("malformed_response")
-            return False
+            return False, "Malformed response"
         if msg.get("action") != "auth_status" or msg.get("status") != "success":
-            self.auth_failed.emit(msg.get("reason", "invalid_credentials"))
-            return False
-        return True
+            return False, msg.get("reason", "invalid_credentials")
+        return True, ""
+
+    # ---- recv loop (background thread) ------------------------------------
+
+    def start_recv_loop(self) -> None:
+        """Spin up a daemon thread that reads inbound messages."""
+        threading.Thread(target=self._recv_loop, daemon=True).start()
+
+    def _recv_loop(self) -> None:
+        while not self._stop:
+            try:
+                line = self.rfile.readline()
+            except OSError:
+                break
+            if not line:
+                break
+            try:
+                msg = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            self._dispatch(msg)
+
+        self._close()
+        if self.on_disconnected:
+            self.on_disconnected()
 
     # ---- inbound dispatch --------------------------------------------------
 
     def _dispatch(self, msg: dict) -> None:
         action = msg.get("action")
         if action == "user_list":
-            self.user_list_changed.emit(list(msg.get("users", [])))
+            if self.on_user_list:
+                self.on_user_list(list(msg.get("users", [])))
         elif action == "system_event":
-            self.system_event.emit(msg.get("type", ""), msg.get("user", ""))
+            if self.on_system_event:
+                self.on_system_event(msg.get("type", ""), msg.get("user", ""))
         elif action in ("dm", "group_msg"):
             sender = msg.get("sender", "")
             target = msg.get("target", "")
             text   = msg.get("message", "")
             if action == "dm":
                 other = target if sender == self.username else sender
-                ctx, signal = f"dm_{other}", self.dm_received
+                ctx = f"dm_{other}"
             else:
-                ctx, signal = f"group_{target}", self.group_received
+                ctx = f"group_{target}"
             local_att = self._save_attachment(ctx, sender, msg.get("attachment"))
             self._log_entry(ctx, sender, text, local_att)
-            signal.emit(sender, target, text, local_att or {})
+            if action == "dm" and self.on_dm:
+                self.on_dm(sender, target, text, local_att or {})
+            elif action == "group_msg" and self.on_group:
+                self.on_group(sender, target, text, local_att or {})
 
     def _log_entry(self, ctx: str, sender: str, text: str, att: Optional[dict]) -> None:
         ts = _ts_now()
         if att is not None:
-            # store path *relative* to log_dir so the JSONL stays portable
             try:
                 rel = os.path.relpath(att["path"], self.log_dir)
             except ValueError:
@@ -249,7 +237,7 @@ class NetworkClient(QThread):
         append_log(self.log_dir, ctx, entry, text_line)
 
     def _save_attachment(self, ctx: str, sender: str, att) -> Optional[dict]:
-        """Decode a base64 image attachment to disk; return UI-side metadata."""
+        """Decode a base64 image attachment to disk; return metadata."""
         if not isinstance(att, dict):
             return None
         mime = att.get("mime", "")
@@ -282,8 +270,6 @@ class NetworkClient(QThread):
 
     # ---- outbound ----------------------------------------------------------
 
-    # Server echoes both DMs and group messages back to the sender, so
-    # logging happens in `_dispatch` for both directions — no double-log.
     def send(self, kind: str, target: str, message: str,
              attachment: Optional[dict] = None) -> None:
         """Send a chat message. `kind` is "dm" or "group"."""
@@ -299,7 +285,6 @@ class NetworkClient(QThread):
 
     def stop(self) -> None:
         self._stop = True
-        # shutting down the socket unblocks readline() on the worker thread
         if self.sock is not None:
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
@@ -315,8 +300,8 @@ class NetworkClient(QThread):
         try:
             with self._send_lock:
                 self.sock.sendall(blob)
-        except OSError as e:
-            self.connection_error.emit(f"send error: {e}")
+        except OSError:
+            pass
 
     def _close(self) -> None:
         for attr in ("rfile", "sock"):

@@ -1,36 +1,21 @@
-"""Chatty server — core.
+"""Chatty server — headless TCP chat server.
 
-`ChatServer` owns the listening socket, a per-client worker thread,
-and the routing of newline-delimited JSON between clients. It exposes
-status as Qt signals so `ServerWindow` (the admin GUI) can render
-them, but contains no widgets itself.
+Listens on a TCP socket, authenticates clients, routes newline-delimited
+JSON messages between them.  No GUI — runs as a CLI process with logging
+to stdout.
 
-Wire protocol — see `ARCHITECTURE.md` § 4. In short:
-
-  client → server   {"action":"login","username","password"}
-                    {"action":"dm","target","message","attachment"?}
-                    {"action":"group_msg","target","message","attachment"?}
-
-  server → client   {"action":"auth_status","status":"success"|"fail",...}
-                    {"action":"user_list","users":[...]}
-                    {"action":"system_event","type":"join|leave","user":...}
-                    {"action":"dm","sender","target","message","attachment"?}
-                    {"action":"group_msg","sender","target","message","attachment"?}
-
-The server echoes outgoing DMs back to the sender so client-side
-logging always happens on the inbound path.
+Wire protocol — see `ARCHITECTURE.md` § 4.
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
+import signal
 import socket
 import sys
 import threading
 from typing import Dict, Optional
-
-from PyQt6.QtCore import QObject, pyqtSignal
-from PyQt6.QtWidgets import QApplication
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +25,13 @@ from PyQt6.QtWidgets import QApplication
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
 USERS_FILE   = os.path.join(os.path.dirname(__file__), "users.json")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("chatty-server")
 
 
 def load_users() -> Dict[str, str]:
@@ -56,20 +48,10 @@ def load_users() -> Dict[str, str]:
 # Core server
 # ---------------------------------------------------------------------------
 
-class ChatServer(QObject):
-    """Listens on a TCP socket, authenticates clients, routes messages.
-
-    All public attributes are read by `ServerWindow` for display only;
-    state mutation is funneled through methods that hold `self._lock`.
-    """
-
-    # Signals (consumed by the admin GUI; safe to ignore for headless use).
-    log_message   = pyqtSignal(str, str)   # level, text  ("info"|"warn"|"err")
-    users_changed = pyqtSignal(list)       # [usernames]  sorted
-    state_changed = pyqtSignal(bool, str)  # listening, "host:port"
+class ChatServer:
+    """Listens on a TCP socket, authenticates clients, routes messages."""
 
     def __init__(self) -> None:
-        super().__init__()
         self.sock: Optional[socket.socket] = None
         # username -> {"sock": socket, "lock": Lock}
         self.clients: Dict[str, dict] = {}
@@ -88,21 +70,19 @@ class ChatServer(QObject):
             s.bind((host, port))
             s.listen()
         except OSError as e:
-            self.log_message.emit("err", f"bind failed: {e}")
+            log.error("bind failed: %s", e)
             return False
 
         self.sock = s
         self.running = True
         threading.Thread(target=self._accept_loop, daemon=True).start()
-        self.state_changed.emit(True, f"{host}:{port}")
-        self.log_message.emit("info", f"listening on {host}:{port}")
+        log.info("listening on %s:%s", host, port)
         return True
 
     def stop(self) -> None:
         if not self.running:
             return
         self.running = False
-        # Close the listener so accept() returns.
         try:
             if self.sock is not None:
                 self.sock.shutdown(socket.SHUT_RDWR)
@@ -115,16 +95,13 @@ class ChatServer(QObject):
             pass
         self.sock = None
 
-        # Drop every connected client.
         with self._lock:
             snapshot = list(self.clients.items())
             self.clients.clear()
         for _, info in snapshot:
             self._safe_close(info["sock"])
 
-        self.users_changed.emit([])
-        self.state_changed.emit(False, "")
-        self.log_message.emit("info", "stopped")
+        log.info("stopped")
 
     # ---- accept loop ------------------------------------------------------
 
@@ -173,8 +150,8 @@ class ChatServer(QObject):
     def _push_user_list(self) -> None:
         with self._lock:
             users = sorted(self.clients.keys())
-        self.users_changed.emit(users)
         self._broadcast({"action": "user_list", "users": users})
+        log.info("online: %s", ", ".join(users) if users else "(none)")
 
     # ---- per-connection thread -------------------------------------------
 
@@ -224,9 +201,7 @@ class ChatServer(QObject):
             # 3. Welcome.
             self._send_to(csock, send_lock,
                           {"action": "auth_status", "status": "success"})
-            self.log_message.emit("info", f"{uname} connected from {addr[0]}")
-            # Include the joiner so they see their own welcome row even when
-            # they're the first / only user online.
+            log.info("%s connected from %s", uname, addr[0])
             self._broadcast(
                 {"action": "system_event", "type": "join", "user": uname},
             )
@@ -250,7 +225,7 @@ class ChatServer(QObject):
             if username is not None:
                 with self._lock:
                     self.clients.pop(username, None)
-                self.log_message.emit("info", f"{username} disconnected")
+                log.info("%s disconnected", username)
                 self._broadcast(
                     {"action": "system_event", "type": "leave", "user": username},
                 )
@@ -284,12 +259,11 @@ class ChatServer(QObject):
             with self._lock:
                 tgt = self.clients.get(target)
                 src = self.clients.get(sender)
-            # Deliver to recipient (if online) and echo to sender.
             if tgt is not None:
                 self._send_to(tgt["sock"], tgt["lock"], out)
             if src is not None:
                 self._send_to(src["sock"], src["lock"], out)
-            self.log_message.emit("info", f"dm {sender} → {target}")
+            log.info("dm %s -> %s", sender, target)
 
         elif action == "group_msg":
             target = str(msg.get("target", "")).strip()
@@ -305,10 +279,10 @@ class ChatServer(QObject):
             if att is not None:
                 out["attachment"] = att
             self._broadcast(out)
-            self.log_message.emit("info", f"group #{target} ← {sender}")
+            log.info("group #%s <- %s", target, sender)
 
         else:
-            self.log_message.emit("warn", f"unknown action from {sender}: {action!r}")
+            log.warning("unknown action from %s: %r", sender, action)
 
     @staticmethod
     def _sanitize_attachment(att) -> Optional[dict]:
@@ -333,23 +307,29 @@ class ChatServer(QObject):
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    # Allow imports from this folder and from the client folder
-    # (the server reuses `theme.py` from the client for visual parity).
-    here       = os.path.dirname(os.path.abspath(__file__))
-    client_dir = os.path.join(os.path.dirname(here), "client")
+    here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, here)
-    sys.path.insert(0, client_dir)
 
-    app = QApplication(sys.argv)
-    app.setApplicationName("Chatty Server")
+    host = os.environ.get("CHATTY_HOST", DEFAULT_HOST)
+    port = int(os.environ.get("CHATTY_PORT", str(DEFAULT_PORT)))
 
-    import theme as T  # noqa: WPS433 — deferred so headless use is possible
-    from server_window import ServerWindow
+    server = ChatServer()
+    if not server.start(host, port):
+        return 1
 
-    app.setStyleSheet(T.build_qss(T.palette(dark=True)))
-    win = ServerWindow()
-    win.show()
-    return app.exec()
+    stop_event = threading.Event()
+
+    def _sig_handler(sig, frame):
+        log.info("shutting down...")
+        server.stop()
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    log.info("press Ctrl+C to stop")
+    stop_event.wait()
+    return 0
 
 
 if __name__ == "__main__":

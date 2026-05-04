@@ -1,149 +1,219 @@
-"""Chatty client — entry point.
+"""Chatty — terminal chat client.
 
-Responsibilities:
-1. Build a `QApplication`, install fonts and the global stylesheet.
-2. Show the login dialog and authenticate against the server.
-3. Hand the live `NetworkClient` connection off to `ChatWindow`.
+No GUI dependencies. Communicates over plain TCP with the Chatty server.
 
-Everything else lives in dedicated modules:
-    - `utils.py`         — pure helpers, constants, timestamp / pixmap utils.
-    - `widgets.py`       — small reusable Qt widgets (bubbles, DM rows…).
-    - `controller.py`    — `ChatController`: state, network glue, business logic.
-    - `chat_window.py`   — `LoginDialog` + `ChatWindow` (pure UI shell).
-    - `network.py`       — TCP client + per-user log management.
-    - `theme.py`         — palette, QSS templates, icon factories.
+Commands:
+  /dm <user> <message>   Send a direct message
+  /switch <context>      Switch context (e.g. group_general, dm_ahmed)
+  /users                 Show online users
+  /dms                   Show DM partners
+  /history               Show recent history for current context
+  /attach <path>         Send an image file
+  /help                  Show commands
+  /quit                  Exit
 """
 from __future__ import annotations
 
+import base64
+import getpass
 import os
 import sys
+import threading
 
-from PyQt6.QtWidgets import (
-    QApplication, QDialog, QLabel, QMessageBox, QVBoxLayout,
-)
-
-# allow running as `python client/main.py`
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import theme as T
-from network import NetworkClient
-from utils import set_app_font
-from controller import ChatController
-from chat_window import ChatWindow, LoginDialog
+from network import NetworkClient, load_history, list_dm_partners, mime_for_path
+from utils import GROUPS, DEFAULT_HOST, DEFAULT_PORT, fmt_ts
 
 
-def _connect_and_authenticate(net: NetworkClient, username: str):
-    """Spin up the network thread and block on the login result.
+class TerminalChat:
+    """Interactive terminal chat session."""
 
-    Buffers any inbound state that arrives before `ChatWindow` is ready so
-    nothing is lost in the gap between auth_success and window construction.
-    Returns `(ok, reason, buffered_events)`."""
-    buf_users:  list = []
-    buf_sys:    list = []
-    buf_dm:     list = []
-    buf_group:  list = []
+    def __init__(self, net: NetworkClient, username: str):
+        self.net = net
+        self.username = username
+        self.current_context = f"group_{GROUPS[0]}"
+        self.online_users: list = []
+        self.dm_partners: set = set()
+        self.unread: dict = {}
+        self._print_lock = threading.Lock()
 
-    def _buf_users(users):           buf_users[:] = list(users)
-    def _buf_sys(event_type, username):           buf_sys.append((event_type, username))
-    def _buf_dm(sender, target, message, attachment):      buf_dm.append((sender, target, message, attachment))
-    def _buf_group(sender, target, message, attachment):   buf_group.append((sender, target, message, attachment))
+        net.on_user_list = self._on_user_list
+        net.on_system_event = self._on_system_event
+        net.on_dm = self._on_dm
+        net.on_group = self._on_group
+        net.on_disconnected = self._on_disconnected
 
-    net.user_list_changed.connect(_buf_users)
-    net.system_event.connect(_buf_sys)
-    net.dm_received.connect(_buf_dm)
-    net.group_received.connect(_buf_group)
+    # ---- callbacks from network thread ------------------------------------
 
-    result = {"ok": False, "reason": ""}
+    def _print(self, msg: str) -> None:
+        with self._print_lock:
+            print(f"\r{msg}")
+            print(f"[{self.current_context}] > ", end="", flush=True)
 
-    connecting = QDialog()
-    connecting.setWindowTitle("Connecting…")
-    connecting.setModal(True)
-    connecting.setFixedSize(320, 110)
-    cv = QVBoxLayout(connecting)
-    cv.addWidget(QLabel(f"Signing in as {username}…"))
-    cv.addStretch(1)
+    def _on_user_list(self, users: list) -> None:
+        self.online_users = users
+        self._print(f"  [online: {', '.join(users)}]")
 
-    def _on_ok():
-        result["ok"] = True
-        connecting.accept()
+    def _on_system_event(self, event: str, user: str) -> None:
+        verb = "joined" if event == "join" else "left"
+        self._print(f"  --- {user} {verb} ---")
 
-    def _on_fail(reason):
-        result["ok"] = False
-        result["reason"] = reason
-        connecting.reject()
+    def _on_dm(self, sender: str, target: str, message: str, att: dict) -> None:
+        other = sender if sender != self.username else target
+        ctx = f"dm_{other}"
+        self.dm_partners.add(other)
+        tag = f" [image: {att.get('name', '')}]" if att.get("path") else ""
+        if ctx == self.current_context:
+            self._print(f"  {sender}: {message}{tag}")
+        else:
+            self.unread[other] = self.unread.get(other, 0) + 1
+            self._print(f"  [DM from {sender}]: {message}{tag}")
 
-    def _on_err(msg):
-        result["ok"] = False
-        result["reason"] = msg
-        connecting.reject()
+    def _on_group(self, sender: str, target: str, message: str, att: dict) -> None:
+        ctx = f"group_{target}"
+        tag = f" [image: {att.get('name', '')}]" if att.get("path") else ""
+        if ctx == self.current_context:
+            self._print(f"  {sender}: {message}{tag}")
+        else:
+            self._print(f"  [#{target} {sender}]: {message}{tag}")
 
-    net.auth_success.connect(_on_ok)
-    net.auth_failed.connect(_on_fail)
-    net.connection_error.connect(_on_err)
+    def _on_disconnected(self) -> None:
+        self._print("  *** Disconnected from server ***")
 
-    net.start()
-    connecting.exec()
+    # ---- history / context ------------------------------------------------
 
-    # Detach buffer + auth-only slots before handing the connection to
-    # the main window (which will register its own slots).
-    try:
-        net.auth_success.disconnect(_on_ok)
-        net.auth_failed.disconnect(_on_fail)
-        net.connection_error.disconnect(_on_err)
-        net.user_list_changed.disconnect(_buf_users)
-        net.system_event.disconnect(_buf_sys)
-        net.dm_received.disconnect(_buf_dm)
-        net.group_received.disconnect(_buf_group)
-    except TypeError:
-        # Some signals may already be disconnected if auth failed early.
-        pass
+    def _load_dm_partners(self) -> None:
+        partners = list_dm_partners(self.net.log_dir)
+        self.dm_partners = set(partners)
 
-    return result["ok"], result["reason"], (buf_users, buf_sys, buf_dm, buf_group)
+    def show_history(self, count: int = 20) -> None:
+        entries = load_history(self.net.log_dir, self.current_context)
+        if not entries:
+            print("  (no history)")
+            return
+        for e in entries[-count:]:
+            ts = fmt_ts(e.get("ts", ""))
+            if e["kind"] == "system":
+                print(f"  --- {e['text']} [{ts}] ---")
+            elif e["kind"] == "image":
+                print(f"  [{ts}] {e['sender']}: [image: {e.get('name', '')}] {e.get('text', '')}")
+            else:
+                print(f"  [{ts}] {e['sender']}: {e['text']}")
 
+    def switch_context(self, ctx: str) -> None:
+        self.current_context = ctx
+        if ctx.startswith("dm_"):
+            other = ctx[3:]
+            self.unread.pop(other, None)
+        print(f"  Switched to {ctx}")
+        self.show_history()
 
-def _replay_buffer(ctrl: ChatController, buffers) -> None:
-    """Feed events that arrived during connect into the controller."""
-    buf_users, buf_sys, buf_dm, buf_group = buffers
-    if buf_users:
-        ctrl.on_user_list(buf_users)
-    for (event_type, username) in buf_sys:
-        ctrl.on_system_event(event_type, username)
-    for (sender, target, message, attachment) in buf_dm:
-        ctrl.on_dm(sender, target, message, attachment)
-    for (sender, target, message, attachment) in buf_group:
-        ctrl.on_group(sender, target, message, attachment)
+    # ---- main loop --------------------------------------------------------
 
+    def run(self) -> None:
+        self._load_dm_partners()
+        print(f"\nLogged in as {self.username}. Context: {self.current_context}")
+        print("Type /help for commands.\n")
+        self.show_history()
+
+        while True:
+            try:
+                line = input(f"[{self.current_context}] > ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            line = line.strip()
+            if not line:
+                continue
+
+            if line == "/quit":
+                break
+            elif line == "/help":
+                print("  /dm <user> <msg>  - Send DM")
+                print("  /switch <ctx>     - Switch context (group_general, dm_ahmed)")
+                print("  /users            - Show online users")
+                print("  /dms              - Show DM partners")
+                print("  /history          - Show recent history")
+                print("  /attach <path>    - Send an image file")
+                print("  /quit             - Exit")
+            elif line == "/users":
+                print(f"  Online: {', '.join(self.online_users) or '(none)'}")
+            elif line == "/dms":
+                if not self.dm_partners:
+                    print("  (no DM partners yet)")
+                for p in sorted(self.dm_partners):
+                    unread = self.unread.get(p, 0)
+                    status = "online" if p in self.online_users else "offline"
+                    badge = f" ({unread} new)" if unread else ""
+                    print(f"  {p} [{status}]{badge}")
+            elif line == "/history":
+                self.show_history()
+            elif line.startswith("/switch "):
+                ctx = line[8:].strip()
+                if not ctx:
+                    print("  Usage: /switch <context>")
+                else:
+                    self.switch_context(ctx)
+            elif line.startswith("/dm "):
+                parts = line[4:].strip().split(None, 1)
+                if len(parts) < 2:
+                    print("  Usage: /dm <user> <message>")
+                else:
+                    target, msg = parts
+                    self.net.send("dm", target, msg)
+                    self.dm_partners.add(target)
+                    if self.current_context != f"dm_{target}":
+                        self.switch_context(f"dm_{target}")
+            elif line.startswith("/attach "):
+                path = line[8:].strip()
+                if not os.path.isfile(path):
+                    print(f"  File not found: {path}")
+                else:
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read()
+                        mime = mime_for_path(path)
+                        b64 = base64.b64encode(data).decode("ascii")
+                        kind, _, target = self.current_context.partition("_")
+                        self.net.send(kind, target, "", attachment={
+                            "mime": mime, "name": os.path.basename(path), "data": b64,
+                        })
+                        print(f"  Sent image: {os.path.basename(path)}")
+                    except Exception as e:
+                        print(f"  Error: {e}")
+            else:
+                kind, _, target = self.current_context.partition("_")
+                self.net.send(kind, target, line)
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
-    app.setApplicationName(" Chatty")
-    set_app_font(app)
-    app.setStyleSheet(T.build_qss(T.palette(dark=True)))
+    print("=== Chatty ===\n")
 
-    while True:
-        login = LoginDialog()
-        if login.exec() != QDialog.DialogCode.Accepted:
-            return 0
-        username, password, host, port = login.credentials()
+    username = input("Username: ").strip()
+    if not username:
+        print("Username required.")
+        return 1
+    password = getpass.getpass("Password: ")
 
-        net = NetworkClient(host, port, username, password)
-        ok, reason, buffers = _connect_and_authenticate(net, username)
+    host = input(f"Host [{DEFAULT_HOST}]: ").strip() or DEFAULT_HOST
+    port_s = input(f"Port [{DEFAULT_PORT}]: ").strip()
+    port = int(port_s) if port_s else DEFAULT_PORT
 
-        if not ok:
-            net.stop()
-            net.wait(1500)
-            QMessageBox.warning(
-                None, "Sign in failed",
-                f"Could not sign in: {reason or 'unknown'}",
-            )
-            continue
+    net = NetworkClient(host, port, username, password)
+    ok, reason = net.connect_and_auth()
+    if not ok:
+        print(f"Login failed: {reason}")
+        return 1
 
-        ctrl = ChatController(net, username)
-        win  = ChatWindow(ctrl)
-        _replay_buffer(ctrl, buffers)
-        win.show()
-        return app.exec()
+    chat = TerminalChat(net, username)
+    net.start_recv_loop()
+    try:
+        chat.run()
+    finally:
+        net.stop()
+    return 0
 
 
 if __name__ == "__main__":
